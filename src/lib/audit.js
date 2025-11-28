@@ -1,4 +1,3 @@
-
 import { supabase } from '@/lib/customSupabaseClient';
 
 export async function logAudit({ groupId, actorUserId, eventType, metadata }) {

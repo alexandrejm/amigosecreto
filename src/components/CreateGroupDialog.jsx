@@ -1,124 +1,218 @@
-
 import React, { useState } from 'react';
-import { supabase } from '@/lib/customSupabaseClient';
-import { useAuth } from '@/contexts/SupabaseAuthContext';
-import { logAudit } from '@/lib/audit';
+import { useNavigate } from 'react-router-dom';
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { useToast } from '@/components/ui/use-toast';
-import { Gift } from 'lucide-react';
+import { supabase } from '@/lib/customSupabaseClient';
+import { useAuth } from '@/contexts/SupabaseAuthContext';
+import { logAudit } from '@/lib/audit';
 
-const CreateGroupDialog = ({ open, onOpenChange, onGroupCreated }) => {
-  const { user } = useAuth();
+const CreateGroupDialog = ({ trigger }) => {
+  const navigate = useNavigate();
   const { toast } = useToast();
-  const [loading, setLoading] = useState(false);
+  const { user } = useAuth();
+
+  const [open, setOpen] = useState(false);
   const [formData, setFormData] = useState({
     name: '',
     description: '',
-    budget_min: '',
-    budget_max: '',
+    budget_min: 50,
+    budget_max: 150,
+    expected_participants: 5,
     signup_deadline: '',
+    draw_date: '',
   });
 
-  const handleChange = (e) => {
-    const { name, value } = e.target;
-    setFormData(prev => ({ ...prev, [name]: value }));
-  };
-
-  const createSlug = (name) => {
+  const generateSlug = (name) => {
     return name
       .toLowerCase()
-      .replace(/ /g, '-')
-      .replace(/[^\w-]+/g, '')
-      + '-' + Math.random().toString(36).substring(2, 8);
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      + '-' + Math.random().toString(36).substring(2, 7);
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    
     if (!user) {
-      toast({ title: "Você não está logado.", variant: "destructive" });
+      toast({ title: 'Você precisa estar logado para criar um grupo.', variant: 'destructive' });
       return;
     }
-    setLoading(true);
 
-    const slug = createSlug(formData.name);
-    const newGroup = {
-      name: formData.name,
-      description: formData.description,
-      budget_min: parseFloat(formData.budget_min) || 0,
-      budget_max: parseFloat(formData.budget_max) || 0,
-      signup_deadline: formData.signup_deadline,
+    const slug = generateSlug(formData.name);
+    
+    const groupData = {
+      ...formData,
+      slug,
       owner_id: user.id,
       owner_email: user.email,
-      slug: slug,
-      status: 'collecting',
+      status: 'active',
     };
 
-    const { data, error } = await supabase
+    // Passo 1: Criar o grupo
+    const { data: newGroup, error: groupError } = await supabase
       .from('groups')
-      .insert(newGroup)
+      .insert(groupData)
       .select()
       .single();
 
-    if (error) {
-      toast({ title: "Erro ao criar grupo", description: error.message, variant: "destructive" });
-    } else {
-      toast({ title: "Grupo criado com sucesso!", description: "Agora convide seus amigos." });
-      
-      await logAudit({
-        groupId: data.id,
-        actorUserId: user.id,
-        eventType: 'group_created',
-        metadata: { name: data.name },
+    if (groupError) {
+      console.error('Erro ao criar grupo:', groupError);
+      toast({ 
+        title: 'Erro ao criar grupo', 
+        description: groupError.message, 
+        variant: 'destructive' 
       });
-
-      onGroupCreated(data);
-      onOpenChange(false);
-      setFormData({ name: '', description: '', budget_min: '', budget_max: '', signup_deadline: '' });
+      return;
     }
 
-    setLoading(false);
+    // Passo 2: Adicionar o dono automaticamente como membro confirmado
+    const ownerMemberData = {
+      group_id: newGroup.id,
+      user_id: user.id,
+      email: user.email,
+      name: user.email.split('@')[0], // Nome padrão baseado no email
+      invite_status: 'confirmed',
+    };
+
+    const { error: memberError } = await supabase
+      .from('group_members')
+      .insert(ownerMemberData);
+
+    if (memberError) {
+      console.error('Aviso: Não foi possível adicionar o dono como membro:', memberError);
+      toast({ 
+        title: 'Grupo criado com aviso', 
+        description: 'O grupo foi criado, mas você precisa se adicionar manualmente como participante.', 
+        variant: 'default' 
+      });
+    }
+
+    // Passo 3: Registrar no audit log
+    await logAudit({ 
+      groupId: newGroup.id, 
+      actorUserId: user.id, 
+      eventType: 'group_created', 
+      metadata: { groupName: newGroup.name } 
+    });
+
+    // Passo 4: Feedback e navegação
+    toast({ 
+      title: 'Grupo criado com sucesso!', 
+      description: `O grupo "${newGroup.name}" está pronto. Convide seus amigos!` 
+    });
+
+    setOpen(false);
+    navigate(`/g/${slug}`);
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader className="text-center">
-          <Gift className="mx-auto h-12 w-12 text-primary" />
-          <DialogTitle className="text-2xl mt-2">Criar um Novo Grupo</DialogTitle>
-          <DialogDescription>
-            Preencha os detalhes abaixo para começar a diversão!
-          </DialogDescription>
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        {trigger || <Button>Criar Novo Grupo</Button>}
+      </DialogTrigger>
+      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>Criar Novo Grupo de Amigo Secreto</DialogTitle>
+          <DialogDescription>Preencha as informações do seu grupo. Você poderá editar depois.</DialogDescription>
         </DialogHeader>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <Label htmlFor="name">Nome do Grupo</Label>
-            <Input id="name" name="name" value={formData.name} onChange={handleChange} placeholder="Ex: Amigo Secreto da Firma" required />
+
+        <form onSubmit={handleSubmit} className="space-y-4 mt-4">
+          <div className="space-y-2">
+            <Label htmlFor="groupName">Nome do Grupo *</Label>
+            <Input
+              id="groupName"
+              placeholder="Ex: Amigo Secreto da Família 2024"
+              value={formData.name}
+              onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+              required
+            />
           </div>
-          <div>
+
+          <div className="space-y-2">
             <Label htmlFor="description">Descrição</Label>
-            <Textarea id="description" name="description" value={formData.description} onChange={handleChange} placeholder="Uma breve descrição sobre o evento" />
+            <Textarea
+              id="description"
+              placeholder="Adicione detalhes sobre o grupo..."
+              value={formData.description}
+              onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+              rows={3}
+            />
           </div>
+
           <div className="grid grid-cols-2 gap-4">
-            <div>
-              <Label htmlFor="budget_min">Orçamento Mínimo (R$)</Label>
-              <Input id="budget_min" name="budget_min" type="number" value={formData.budget_min} onChange={handleChange} placeholder="Ex: 50" />
+            <div className="space-y-2">
+              <Label htmlFor="budgetMin">Orçamento Mínimo (R$) *</Label>
+              <Input
+                id="budgetMin"
+                type="number"
+                min="0"
+                value={formData.budget_min}
+                onChange={(e) => setFormData({ ...formData, budget_min: parseFloat(e.target.value) })}
+                required
+              />
             </div>
-            <div>
-              <Label htmlFor="budget_max">Orçamento Máximo (R$)</Label>
-              <Input id="budget_max" name="budget_max" type="number" value={formData.budget_max} onChange={handleChange} placeholder="Ex: 100" />
+            <div className="space-y-2">
+              <Label htmlFor="budgetMax">Orçamento Máximo (R$) *</Label>
+              <Input
+                id="budgetMax"
+                type="number"
+                min="0"
+                value={formData.budget_max}
+                onChange={(e) => setFormData({ ...formData, budget_max: parseFloat(e.target.value) })}
+                required
+              />
             </div>
           </div>
-          <div>
-            <Label htmlFor="signup_deadline">Data Limite para Inscrição</Label>
-            <Input id="signup_deadline" name="signup_deadline" type="date" value={formData.signup_deadline} onChange={handleChange} required />
+
+          <div className="space-y-2">
+            <Label htmlFor="expectedParticipants">Número Esperado de Participantes *</Label>
+            <Input
+              id="expectedParticipants"
+              type="number"
+              min="3"
+              value={formData.expected_participants}
+              onChange={(e) => setFormData({ ...formData, expected_participants: parseInt(e.target.value) })}
+              required
+            />
           </div>
-          <Button type="submit" className="w-full" disabled={loading}>
-            {loading ? 'Criando...' : 'Criar Grupo'}
-          </Button>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label htmlFor="signupDeadline">Prazo para Inscrições *</Label>
+              <Input
+                id="signupDeadline"
+                type="date"
+                value={formData.signup_deadline}
+                onChange={(e) => setFormData({ ...formData, signup_deadline: e.target.value })}
+                required
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="drawDate">Data do Sorteio *</Label>
+              <Input
+                id="drawDate"
+                type="date"
+                value={formData.draw_date}
+                onChange={(e) => setFormData({ ...formData, draw_date: e.target.value })}
+                required
+              />
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-2 pt-4">
+            <Button type="button" variant="outline" onClick={() => setOpen(false)}>
+              Cancelar
+            </Button>
+            <Button type="submit">
+              Criar Grupo
+            </Button>
+          </div>
         </form>
       </DialogContent>
     </Dialog>

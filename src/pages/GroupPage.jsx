@@ -1,8 +1,7 @@
-
 import React, { useState, useEffect, useCallback } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, Link } from 'react-router-dom';
 import { Helmet } from 'react-helmet';
-import { Gift, Users, Settings, MessageCircle, Copy, Send, MoreVertical, Trash, Bell } from 'lucide-react';
+import { Gift, Users, Settings, MessageCircle, Copy, Send, MoreVertical, Trash, Bell, ArrowLeft } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -17,6 +16,112 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { supabase } from '@/lib/customSupabaseClient';
 import { useAuth } from '@/contexts/SupabaseAuthContext';
 import { logAudit } from '@/lib/audit';
+import { sendInviteNotification } from '@/lib/notifications';
+
+const ChatMessages = ({ group, members, isOwner }) => {
+    const { user } = useAuth();
+    const { toast } = useToast();
+    const [messages, setMessages] = useState([]);
+    const [newMessage, setNewMessage] = useState('');
+
+    const fetchMessages = useCallback(async () => {
+        if (!group?.id) return;
+        const { data, error } = await supabase
+            .from('messages')
+            .select('*')
+            .eq('group_id', group.id)
+            .order('created_at', { ascending: true });
+
+        if (error) {
+            console.error("Error fetching messages:", error);
+            toast({ title: "Erro ao carregar o chat.", description: "Tente recarregar a página.", variant: 'destructive' });
+        } else {
+            setMessages(data);
+        }
+    }, [group?.id, toast]);
+
+    useEffect(() => {
+        fetchMessages();
+        
+        const channel = supabase.channel(`messages-group-${group.id}`)
+            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `group_id=eq.${group.id}` }, (payload) => {
+                setMessages(current => [...current, payload.new]);
+            })
+            .subscribe((status) => {
+                if (status === 'SUBSCRIBED') {
+                    console.log('Subscribed to messages channel!');
+                }
+            });
+
+        return () => {
+            supabase.removeChannel(channel);
+        };
+    }, [group.id, fetchMessages]);
+
+    const handleSendMessage = async (e) => {
+        e.preventDefault();
+        if (!newMessage.trim() || !user) return;
+        
+        const myMemberProfile = members.find(m => m.user_id === user.id);
+        if (!myMemberProfile) {
+            toast({ title: 'Você não é membro deste grupo para enviar mensagens.', variant: 'destructive' });
+            return;
+        }
+
+        const { error } = await supabase.from('messages').insert({
+            group_id: group.id,
+            member_id: myMemberProfile.id,
+            content: newMessage,
+        });
+
+        if (error) {
+            toast({ title: 'Erro ao enviar mensagem', description: error.message, variant: 'destructive' });
+        } else {
+            setNewMessage('');
+        }
+    };
+    
+    const getMemberInfo = (memberId) => members.find(m => m.id === memberId) || {};
+
+    return (
+        <Card>
+            <CardHeader>
+                <CardTitle>Chat Anônimo do Grupo</CardTitle>
+                <CardDescription>Envie mensagens para os outros participantes. Apenas o dono do grupo pode ver seu nome.</CardDescription>
+            </CardHeader>
+            <CardContent>
+                <div className="h-[400px] overflow-y-auto space-y-4 pr-4 border-b pb-4 mb-4">
+                    {messages.map(msg => {
+                        const memberInfo = getMemberInfo(msg.member_id);
+                        const isMyMessage = memberInfo?.user_id === user.id;
+
+                        return (
+                            <div key={msg.id} className={`flex flex-col ${isMyMessage ? 'items-end' : 'items-start'}`}>
+                                <div className={`rounded-lg px-4 py-2 max-w-[80%] ${isMyMessage ? 'bg-primary text-primary-foreground' : 'bg-muted'}`}>
+                                    <p>{msg.content}</p>
+                                </div>
+                                <span className="text-xs text-muted-foreground mt-1">
+                                    {isOwner ? (memberInfo?.name || 'Anônimo') : (isMyMessage ? 'Você' : 'Anônimo')}
+                                </span>
+                            </div>
+                        )
+                    })}
+                    {messages.length === 0 && (
+                        <div className="text-center text-muted-foreground pt-16">
+                            <MessageCircle className="h-12 w-12 mx-auto mb-2 opacity-30"/>
+                            <p>Nenhuma mensagem ainda. Seja o primeiro a dizer olá!</p>
+                        </div>
+                    )}
+                </div>
+                <form onSubmit={handleSendMessage} className="flex gap-2">
+                    <Input value={newMessage} onChange={e => setNewMessage(e.target.value)} placeholder="Digite sua mensagem anônima..." disabled={!members.some(m => m.user_id === user.id)} />
+                    <Button type="submit" disabled={!newMessage.trim() || !members.some(m => m.user_id === user.id)}><Send className="h-4 w-4"/></Button>
+                </form>
+            </CardContent>
+        </Card>
+    );
+};
+
 
 const GroupPage = () => {
   const { groupSlug } = useParams();
@@ -30,6 +135,8 @@ const GroupPage = () => {
   const [inviteEmail, setInviteEmail] = useState('');
   const [loading, setLoading] = useState(true);
   const [settingsData, setSettingsData] = useState(null);
+
+  const isOwner = user?.id === group?.owner_id;
 
   const fetchGroupData = useCallback(async () => {
     setLoading(true);
@@ -63,7 +170,7 @@ const GroupPage = () => {
       .order('created_at', { ascending: true });
       
     if (membersError) {
-        toast({ title: 'Erro ao buscar membros', variant: 'destructive' });
+        toast({ title: 'Erro ao buscar membros', description: membersError.message, variant: 'destructive' });
     } else {
         setMembers(membersData);
     }
@@ -97,15 +204,17 @@ const GroupPage = () => {
     }
 
     const inviteToken = `token_${Date.now()}${Math.random()}`;
+    const newMemberData = {
+        group_id: group.id,
+        email: inviteEmail,
+        invite_status: 'sent',
+        invite_token: inviteToken,
+        name: inviteEmail.split('@')[0], // default name
+    };
+
     const { data: newMember, error } = await supabase
         .from('group_members')
-        .insert({
-            group_id: group.id,
-            email: inviteEmail,
-            invite_status: 'sent',
-            invite_token: inviteToken,
-            name: inviteEmail.split('@')[0], // default name
-        })
+        .insert(newMemberData)
         .select()
         .single();
     
@@ -115,7 +224,40 @@ const GroupPage = () => {
         setMembers(prev => [...prev, newMember]);
         setInviteEmail('');
         await logAudit({ groupId: group.id, actorUserId: user.id, eventType: 'member_invited', metadata: { email: inviteEmail } });
-        toast({ title: "Convite enviado!", description: `Convite para ${inviteEmail} foi registrado. Funcionalidade de envio de email pendente.` });
+        
+        toast({ title: "Convite registrado!", description: `Um e-mail de convite será enviado para ${inviteEmail}.` });
+
+        // Envia o e-mail em segundo plano
+        sendInviteNotification(group, newMember).then(({ error: emailError }) => {
+            if (emailError) {
+                 console.warn(`Falha ao enviar e-mail de convite para ${inviteEmail}: ${emailError.message}`);
+                 // Opcional: pode-se adicionar um toast de aviso aqui se desejar
+                 toast({ title: "Aviso: Falha ao enviar e-mail de convite.", description: 'O membro foi adicionado, mas o e-mail não pôde ser enviado.', variant: "destructive" });
+            }
+        });
+    }
+  };
+
+  const handleResendInvite = async (member) => {
+    if (!member) return;
+    toast({ title: "Reenviando convite..." });
+    const { error: emailError } = await sendInviteNotification(group, member);
+    if (emailError) {
+      toast({ title: "Falha ao reenviar e-mail.", description: `Verifique as configurações SMTP. Detalhes: ${emailError.message}`, variant: "destructive" });
+    } else {
+      toast({ title: "Convite reenviado!", description: `Um novo convite foi enviado para ${member.email}.` });
+    }
+  };
+  
+  const handleRemoveParticipant = async (memberId) => {
+    if (!isOwner) return;
+    const { error } = await supabase.from('group_members').delete().eq('id', memberId);
+    if (error) {
+      toast({ title: "Erro ao remover participante", description: error.message, variant: 'destructive' });
+    } else {
+      toast({ title: "Participante removido com sucesso!" });
+      setMembers(prev => prev.filter(m => m.id !== memberId));
+      await logAudit({ groupId: group.id, actorUserId: user.id, eventType: 'member_removed', metadata: { removedMemberId: memberId } });
     }
   };
 
@@ -126,54 +268,22 @@ const GroupPage = () => {
       return;
     }
 
-    // This logic should be moved to a Supabase Edge Function for security
-    const shuffled = [...confirmedMembers].sort(() => Math.random() - 0.5);
-    let assignmentsToInsert = [];
-    let isValid = false;
-    for(let i=0; i<10; i++) { // Try to generate a valid derangement
-        let isDerangement = true;
-        assignmentsToInsert = confirmedMembers.map((giver, index) => {
-            const receiver = shuffled[(index + 1) % shuffled.length];
-            if(giver.id === receiver.id) isDerangement = false;
-            return {
-                group_id: group.id,
-                giver_member_id: giver.id,
-                receiver_member_id: receiver.id,
-            };
-        });
-        if(isDerangement) {
-            isValid = true;
-            break;
-        }
-        shuffled.sort(() => Math.random() - 0.5); // reshuffle
-    }
-    
-    if(!isValid) {
-        toast({ title: "Erro no sorteio", description: "Não foi possível gerar um sorteio válido. Tente novamente.", variant: "destructive" });
-        return;
-    }
+    const { data, error } = await supabase.functions.invoke('execute-draw', {
+      body: { groupId: group.id }
+    });
 
-    const { error: assignmentError } = await supabase.from('assignments').insert(assignmentsToInsert);
-
-    if (assignmentError) {
-        toast({ title: "Erro ao salvar o sorteio", description: assignmentError.message, variant: "destructive" });
-        return;
-    }
-
-    const { error: groupUpdateError } = await supabase.from('groups').update({ status: 'drawn' }).eq('id', group.id);
-
-    if (groupUpdateError) {
-        toast({ title: "Erro ao atualizar status do grupo", description: groupUpdateError.message, variant: "destructive" });
+    if (error || data?.error) {
+      toast({ title: "Erro ao executar o sorteio", description: error?.message || data?.error, variant: "destructive" });
     } else {
-        await logAudit({ groupId: group.id, actorUserId: user.id, eventType: 'draw_executed' });
-        toast({ title: "Sorteio realizado com sucesso!", description: "Os participantes podem ver seus amigos secretos." });
-        fetchGroupData();
+      await logAudit({ groupId: group.id, actorUserId: user.id, eventType: 'draw_executed' });
+      toast({ title: "Sorteio realizado com sucesso!", description: "Os participantes serão notificados por e-mail." });
+      fetchGroupData();
     }
   };
   
   const handleSettingsUpdate = async (e) => {
     e.preventDefault();
-    if (!user || group.owner_id !== user.id) return;
+    if (!isOwner) return;
 
     const { error } = await supabase
         .from('groups')
@@ -189,15 +299,29 @@ const GroupPage = () => {
     }
   };
   
+  const handleDeleteGroup = async () => {
+    if (!isOwner) return;
+    
+    const { error } = await supabase.rpc('delete_group_and_dependents', {
+      group_id_to_delete: group.id
+    });
+
+    if (error) {
+        toast({ title: "Erro ao excluir o grupo", description: error.message, variant: "destructive" });
+    } else {
+        toast({ title: "Grupo excluído com sucesso."});
+        navigate('/dashboard');
+    }
+  };
+  
   const copyInviteLink = () => {
-    const inviteLink = `${window.location.origin}/g/${groupSlug}/join`;
+    const inviteLink = `${window.location.origin}/#/g/${groupSlug}/join`;
     navigator.clipboard.writeText(inviteLink);
     toast({ title: "Link de convite copiado!" });
   };
   
   if (loading || !group || !settingsData) return <div className="p-8">Carregando...</div>;
-
-  const isOwner = user?.id === group.owner_id;
+  
   const confirmedMembersCount = members.filter(m => m.invite_status === 'confirmed').length;
 
   return (
@@ -205,13 +329,22 @@ const GroupPage = () => {
       <Helmet><title>{group.name} - Amigo Secreto</title></Helmet>
       <div className="container mx-auto p-4 md:p-8">
         <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6">
-          <div>
-            <h1 className="text-4xl font-bold bg-gradient-to-r from-primary to-pink-600 bg-clip-text text-transparent">{group.name}</h1>
-            <p className="text-muted-foreground mt-2">{group.description}</p>
+          <div className="flex items-center gap-4">
+             {isOwner && (
+              <Link to="/dashboard">
+                <Button variant="outline" size="icon">
+                  <ArrowLeft className="h-4 w-4" />
+                </Button>
+              </Link>
+            )}
+            <div>
+              <h1 className="text-4xl font-bold bg-gradient-to-r from-primary to-pink-600 bg-clip-text text-transparent">{group.name}</h1>
+              <p className="text-muted-foreground mt-2">{group.description}</p>
+            </div>
           </div>
           {isOwner && (
-            <div className="flex gap-2 mt-4 md:mt-0">
-                <Button variant="outline" onClick={copyInviteLink}><Copy className="h-4 w-4 mr-2" /> Copiar Link Público</Button>
+            <div className="flex gap-2 mt-4 md:mt-0 self-end md:self-center">
+                <Button variant="outline" onClick={copyInviteLink}><Copy className="h-4 w-4 mr-2" /> Copiar Link</Button>
                 {group.status !== 'drawn' && (
                 <AlertDialog>
                     <AlertDialogTrigger asChild>
@@ -222,7 +355,7 @@ const GroupPage = () => {
                     <AlertDialogContent>
                     <AlertDialogHeader>
                         <AlertDialogTitle>Confirmar Sorteio?</AlertDialogTitle>
-                        <AlertDialogDescription>Esta ação é irreversível e notificará todos os participantes.</AlertDialogDescription>
+                        <AlertDialogDescription>Esta ação é irreversível e notificará todos os participantes por e-mail.</AlertDialogDescription>
                     </AlertDialogHeader>
                     <AlertDialogFooter>
                         <AlertDialogCancel>Cancelar</AlertDialogCancel>
@@ -270,10 +403,26 @@ const GroupPage = () => {
                           {isOwner && (
                             <TableCell className="text-right">
                              <DropdownMenu>
-                                <DropdownMenuTrigger asChild><Button variant="ghost" size="icon"><MoreVertical className="h-4 w-4" /></Button></DropdownMenuTrigger>
+                                <DropdownMenuTrigger asChild><Button variant="ghost" size="icon" disabled={group.status === 'drawn'}><MoreVertical className="h-4 w-4" /></Button></DropdownMenuTrigger>
                                 <DropdownMenuContent>
-                                  <DropdownMenuItem onClick={() => toast({ description: '🚧 Recurso em desenvolvimento!' })}><Send className="h-4 w-4 mr-2"/>Reenviar Convite</DropdownMenuItem>
-                                  <DropdownMenuItem className="text-red-500" onClick={() => toast({ description: '🚧 Recurso em desenvolvimento!' })}><Trash className="h-4 w-4 mr-2"/>Remover</DropdownMenuItem>
+                                  <DropdownMenuItem onClick={() => handleResendInvite(member)} disabled={member.invite_status === 'confirmed'}><Send className="h-4 w-4 mr-2"/>Reenviar Convite</DropdownMenuItem>
+                                   <AlertDialog>
+                                    <AlertDialogTrigger asChild>
+                                      <Button variant="ghost" className="text-red-500 w-full justify-start px-2 py-1.5 h-auto font-normal" disabled={member.user_id === group.owner_id}>
+                                        <Trash className="h-4 w-4 mr-2"/>Remover
+                                      </Button>
+                                    </AlertDialogTrigger>
+                                    <AlertDialogContent>
+                                      <AlertDialogHeader>
+                                        <AlertDialogTitle>Remover {member.name}?</AlertDialogTitle>
+                                        <AlertDialogDescription>Esta ação não pode ser desfeita. O participante precisará ser convidado novamente.</AlertDialogDescription>
+                                      </AlertDialogHeader>
+                                      <AlertDialogFooter>
+                                        <AlertDialogCancel>Cancelar</AlertDialogCancel>
+                                        <AlertDialogAction onClick={() => handleRemoveParticipant(member.id)} className="bg-destructive hover:bg-destructive/90 text-destructive-foreground">Confirmar</AlertDialogAction>
+                                      </AlertDialogFooter>
+                                    </AlertDialogContent>
+                                  </AlertDialog>
                                 </DropdownMenuContent>
                               </DropdownMenu>
                             </TableCell>
@@ -286,7 +435,9 @@ const GroupPage = () => {
               </CardContent>
             </Card>
           </TabsContent>
-          <TabsContent value="messages"><Card className="min-h-[400px] flex items-center justify-center"><CardContent className="text-center text-muted-foreground"><MessageCircle className="h-16 w-16 mx-auto mb-4 opacity-30"/><p>🚧 Chat anônimo em construção 🚧</p></CardContent></Card></TabsContent>
+          <TabsContent value="messages">
+            <ChatMessages group={group} members={members} isOwner={isOwner} />
+          </TabsContent>
           <TabsContent value="notifications"><Card className="min-h-[400px] flex items-center justify-center"><CardContent className="text-center text-muted-foreground"><Bell className="h-16 w-16 mx-auto mb-4 opacity-30"/><p>🚧 Histórico de notificações em construção 🚧</p></CardContent></Card></TabsContent>
           
           {isOwner && (
@@ -307,6 +458,29 @@ const GroupPage = () => {
                     </div>
                     {group.status === 'drawn' && <p className="text-sm text-destructive text-right mt-2">As configurações não podem ser alteradas após o sorteio.</p>}
                   </form>
+                  <div className="mt-10 border-t pt-6 border-destructive/50">
+                    <h3 className="text-lg font-semibold text-destructive">Zona de Perigo</h3>
+                    <p className="text-sm text-muted-foreground mb-4">Esta ação não pode ser desfeita. Isso excluirá permanentemente o grupo e todos os seus dados.</p>
+                     <AlertDialog>
+                      <AlertDialogTrigger asChild>
+                        <Button variant="destructive">Excluir Grupo</Button>
+                      </AlertDialogTrigger>
+                      <AlertDialogContent>
+                        <AlertDialogHeader>
+                          <AlertDialogTitle>Você tem certeza absoluta?</AlertDialogTitle>
+                          <AlertDialogDescription>
+                            Esta ação não pode ser desfeita. Isso excluirá permanentemente o grupo <strong>{group.name}</strong> e todos os seus dados, incluindo membros e sorteios.
+                          </AlertDialogDescription>
+                        </AlertDialogHeader>
+                        <AlertDialogFooter>
+                          <AlertDialogCancel>Cancelar</AlertDialogCancel>
+                          <AlertDialogAction onClick={handleDeleteGroup} className="bg-destructive hover:bg-destructive/90 text-destructive-foreground">
+                            Sim, excluir grupo
+                          </AlertDialogAction>
+                        </AlertDialogFooter>
+                      </AlertDialogContent>
+                    </AlertDialog>
+                  </div>
                 </CardContent>
               </Card>
             </TabsContent>
